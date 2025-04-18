@@ -5,76 +5,29 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module StockData
-  ( downloadHistoricalData
-  , downloadSMAData
-  , processStock
-  , plotCombined
+  ( fetchHistoricalData
+  , fetchSMAData
+  , parseDate
+  , TimeSeries(..)
+  , TechnicalAnalysis(..)
+  , SMADatum(..)
   ) where
 
-import Control.Concurrent (threadDelay)
-import Control.Exception (handle)
-import Control.Monad (foldM_)
-import Control.Lens ((.=))
+import Control.Exception (SomeException, handle)
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Time (UTCTime, getCurrentTime, diffUTCTime)
+import Data.Time (UTCTime)
 import Data.Time.Format (parseTimeOrError, defaultTimeLocale)
-import qualified Graphics.Rendering.Chart.Easy as CE
-import Graphics.Rendering.Chart.Backend.Diagrams (renderableToFile)
-import Data.Default.Class (def)
-import Network.HTTP.Types (statusCode)
 import Network.HTTP.Client qualified as Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Simple (parseRequest)
-import Data.Aeson hiding ((.=))
+import Network.HTTP.Types.Status (status429)
+import Data.Aeson
 import Data.Aeson.KeyMap qualified as KM
 import Data.List (isInfixOf)
 
-
--- API Configuration
-apiKey :: String
-apiKey = "ADTW707HBTBIH3EI"
-
--- Enhanced HTTP Client with Retries and Latency Tracking
-stockHttpJSON :: forall a. FromJSON a => String -> IO (Either String a)
-stockHttpJSON originalUrl = retry 3
-  where
-    retry :: Int -> IO (Either String a)
-    retry 0 = return $ Left "Max retries reached"
-    retry n = stockHttpJSONOnce >>= handleRetry n
-
-    handleRetry n (Left err, _) 
-      | shouldRetry err = 
-          threadDelay delay >> retry (n-1)
-      where delay = 2 ^ (4 - n) * 1000000
-    handleRetry _ (result, _) = return result
-
-    stockHttpJSONOnce :: IO (Either String a, Double)
-    stockHttpJSONOnce = handle handler $ do
-      manager <- Client.newManager tlsManagerSettings 
-        { Client.managerResponseTimeout = Client.responseTimeoutMicro 5000000 }
-      request <- parseRequest originalUrl
-      startTime <- getCurrentTime
-      response <- Client.httpLbs request manager
-      endTime <- getCurrentTime
-      let latency = realToFrac (diffUTCTime endTime startTime)
-          status = Client.responseStatus response
-          body = Client.responseBody response
-      if statusCode status == 429
-        then return (Left "API rate limit exceeded", latency)
-        else case decode body of
-          Just (Object o) 
-            | KM.member "Error Message" o -> return (Left "API error: Invalid request", latency)
-            | KM.member "Information" o -> return (Left "API error: Premium endpoint", latency)
-          _ -> case eitherDecode body of
-            Left err -> return (Left err, latency)
-            Right val -> return (Right val, latency)
-
-    shouldRetry err = any (`isInfixOf` err) ["API rate limit exceeded", "HttpException", "timed out"]
-    handler :: Client.HttpException -> IO (Either String a, Double)
-    handler e = return (Left ("HTTP error: " ++ show e), 0)
-
 -- Data Types
+
 data TimeSeries = TimeSeries
   { tsMetaData :: HistoricalMetaData
   , timeSeriesDaily :: Map String DailyData
@@ -156,51 +109,46 @@ instance FromJSON SMADatum where
   parseJSON = withObject "SMADatum" $ \v -> SMADatum
     <$> (read <$> v .: "SMA")
 
--- Pure transformation
+-- Date Parsing
 parseDate :: String -> UTCTime
 parseDate = parseTimeOrError True defaultTimeLocale "%Y-%m-%d"
 
-extractHistoricalPrices :: TimeSeries -> [(UTCTime, Double)]
-extractHistoricalPrices (TimeSeries _ ts) =
-  map (\(date, DailyData{close}) -> (parseDate date, close)) (Map.toList ts)
-
-extractSMAValues :: TechnicalAnalysis -> [(UTCTime, Double)]
-extractSMAValues (TechnicalAnalysis _ ta) =
-  map (\(date, SMADatum{smaValue}) -> (parseDate date, smaValue)) (Map.toList ta)
-
--- IO Boundary
-downloadHistoricalData :: String -> IO (Either String [(UTCTime, Double)])
-downloadHistoricalData symbol =
-  stockHttpJSON url >>= \case
-    Right ts -> return $ Right (extractHistoricalPrices ts)
-    Left err -> return $ Left err
+-- Pure fetcher wrapper
+fetchJson :: FromJSON a => String -> IO (Either String a)
+fetchJson url = handle handler $ do
+  manager <- Client.newManager tlsManagerSettings
+  request <- parseRequest url
+  response <- Client.httpLbs request manager
+  let body = Client.responseBody response
+      status = Client.responseStatus response
+  if status == status429
+    then return $ Left "API rate limit exceeded"
+    else case decode body of
+      Just (Object o)
+        | KM.member "Error Message" o -> return $ Left "API error: Invalid request"
+        | KM.member "Information" o -> return $ Left "API error: Premium endpoint"
+      _ -> case eitherDecode body of
+        Left err -> return $ Left err
+        Right val -> return $ Right val
   where
-    url = "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol="
-        ++ symbol ++ "&apikey=" ++ apiKey ++ "&outputsize=compact"
+    handler :: SomeException -> IO (Either String a)
+    handler e = return $ Left ("HTTP error: " ++ show e)
 
-downloadSMAData :: String -> IO (Either String [(UTCTime, Double)])
-downloadSMAData symbol =
-  stockHttpJSON url >>= \case
-    Right ta -> return $ Right (extractSMAValues ta)
+-- Fetchers return pure Either
+fetchHistoricalData :: String -> IO (Either String [(UTCTime, Double)])
+fetchHistoricalData symbol = do
+  let url = "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol="
+         ++ symbol ++ "&apikey=ADTW707HBTBIH3EI&outputsize=compact"
+  fetchJson url >>= \case
+    Right (TimeSeries _ ts) ->
+      return $ Right $ map (\(date, DailyData{close}) -> (parseDate date, close)) (Map.toList ts)
     Left err -> return $ Left err
-  where
-    url = "https://www.alphavantage.co/query?function=SMA&symbol="
-        ++ symbol ++ "&interval=daily&time_period=10&series_type=close&apikey=" ++ apiKey
 
--- Pure data combiner
-processStock :: String -> Either String ([(UTCTime, Double)], [(UTCTime, Double)]) -> Maybe (String, [(UTCTime, Double)], [(UTCTime, Double)])
-processStock symbol (Right (h, s)) = Just (symbol, h, s)
-processStock _ (Left _) = Nothing
-
--- Visualization
-plotCombined :: [(String, [(UTCTime, Double)], [(UTCTime, Double)])] -> IO ()
-plotCombined stocksData =
-  let layout = CE.execEC $ do
-        CE.layout_title .= "Real-Time Stock Analysis"
-        CE.layout_x_axis . CE.laxis_title .= "Date"
-        CE.layout_y_axis . CE.laxis_title .= "Price (USD)"
-        foldM_ (\_ (symbol, prices, sma) -> do
-          CE.plot (CE.line (symbol ++ " Price") [prices]) 
-          CE.plot (CE.line (symbol ++ " SMA-10") [sma])) () stocksData
-  in renderableToFile def "combined_chart.svg" (CE.toRenderable layout)
-     >> putStrLn "Updated combined chart saved as combined_chart.svg"
+fetchSMAData :: String -> IO (Either String [(UTCTime, Double)])
+fetchSMAData symbol = do
+  let url = "https://www.alphavantage.co/query?function=SMA&symbol="
+         ++ symbol ++ "&interval=daily&time_period=10&series_type=close&apikey=ADTW707HBTBIH3EI"
+  fetchJson url >>= \case
+    Right (TechnicalAnalysis _ ta) ->
+      return $ Right $ map (\(date, SMADatum{smaValue}) -> (parseDate date, smaValue)) (Map.toList ta)
+    Left err -> return $ Left err
